@@ -18,6 +18,8 @@ interface PlayerEngineController {
     fun clearExternalSubtitle()
     fun clearExternalSubtitleAndSelect(trackIndex: Int)
     fun applySubtitleStyle(style: SubtitleStyleState) {}
+    fun setSubtitleDelayMs(delayMs: Int) {}
+    fun configureIosVideoOutput(settings: PlayerSettingsUiState) {}
 }
 
 internal fun sanitizePlaybackHeaders(headers: Map<String, String>?): Map<String, String> {
