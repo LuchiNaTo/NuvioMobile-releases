@@ -25,6 +25,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.compose_player_no_subtitles_found
+import nuvio.composeapp.generated.resources.player_addon_subtitle_display_format
 import org.jetbrains.compose.resources.getString
 
 object SubtitleRepository {
@@ -85,7 +86,11 @@ object SubtitleRepository {
                                 id = id,
                                 url = url,
                                 language = normalizedLang,
-                                display = "${getLanguageLabelForCode(rawLang)} (${addon.displayTitle})",
+                                display = getString(
+                                    Res.string.player_addon_subtitle_display_format,
+                                    getLanguageLabelForCode(rawLang),
+                                    addon.displayTitle,
+                                ),
                                 addonName = addon.displayTitle,
                             )
                         )
@@ -96,7 +101,7 @@ object SubtitleRepository {
             }
 
             _addonSubtitles.value = allSubs
-            if (allSubs.isEmpty() && addons.any { it.manifest?.resources?.any { r -> r.name == "subtitles" } == true }) {
+            if (allSubs.isEmpty() && addons.any { it.manifest?.resources?.any { r -> r.name.isSubtitleResourceName() } == true }) {
                 _error.value = getString(Res.string.compose_player_no_subtitles_found)
             }
             _isLoading.value = false
@@ -118,7 +123,8 @@ private fun String.isSubtitleResourceName(): Boolean =
     equals("subtitles", ignoreCase = true) || equals("subtitle", ignoreCase = true)
 
 private fun AddonResource.supportsSubtitleType(type: String, videoId: String): Boolean {
-    val typeMatches = types.isEmpty() || types.any { it.equals(type, ignoreCase = true) }
+    val canonical = canonicalSubtitleType(type)
+    val typeMatches = types.isEmpty() || types.any { canonicalSubtitleType(it).equals(canonical, ignoreCase = true) }
     if (!typeMatches) return false
     return idPrefixes.isEmpty() || idPrefixes.any { prefix -> videoId.startsWith(prefix) }
 }

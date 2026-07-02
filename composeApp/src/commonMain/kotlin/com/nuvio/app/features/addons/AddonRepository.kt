@@ -2,6 +2,7 @@ package com.nuvio.app.features.addons
 
 import co.touchlab.kermit.Logger
 import com.nuvio.app.core.network.SupabaseProvider
+import com.nuvio.app.core.sync.putSyncOriginClientId
 import com.nuvio.app.features.profiles.ProfileRepository
 import io.github.jan.supabase.postgrest.postgrest
 import io.github.jan.supabase.postgrest.query.Order
@@ -16,6 +17,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
@@ -150,6 +152,7 @@ object AddonRepository {
                     val params = buildJsonObject {
                         put("p_profile_id", currentProfileId)
                         put("p_addons", json.encodeToJsonElement(addons))
+                        putSyncOriginClientId()
                     }
                     SupabaseProvider.client.postgrest.rpc("sync_push_addons", params)
                     log.i { "pullFromServer() — migration push done (${addons.size} addons)" }
@@ -395,6 +398,7 @@ object AddonRepository {
                 val params = buildJsonObject {
                     put("p_profile_id", profileId)
                     put("p_addons", json.encodeToJsonElement(addons))
+                    putSyncOriginClientId()
                 }
                 SupabaseProvider.client.postgrest.rpc("sync_push_addons", params)
                 log.d { "pushToServer() — success" }
@@ -497,7 +501,7 @@ private fun ensureManifestSuffix(url: String): String {
 
 private fun normalizeManifestUrl(rawUrl: String): String {
     val trimmed = rawUrl.trim()
-    require(trimmed.isNotEmpty()) { "Enter an addon URL." }
+    require(trimmed.isNotEmpty()) { runBlocking { getString(Res.string.addons_error_enter_url) } }
 
     val normalizedScheme = when {
         trimmed.startsWith("http://") || trimmed.startsWith("https://") -> trimmed

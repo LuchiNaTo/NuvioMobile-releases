@@ -15,11 +15,7 @@ import com.nuvio.app.features.player.PlayerSettingsRepository
 import com.nuvio.app.features.plugins.PluginRepository
 import com.nuvio.app.features.plugins.pluginContentId
 import com.nuvio.app.features.plugins.PluginsUiState
-import com.nuvio.app.features.plugins.PluginRepositoryItem
-import com.nuvio.app.features.plugins.PluginRuntimeResult
-import com.nuvio.app.features.plugins.PluginScraper
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -107,6 +103,7 @@ object StreamsRepository {
         PlayerSettingsRepository.ensureLoaded()
         val playerSettings = PlayerSettingsRepository.uiState.value
         val debridSettings = DebridSettingsRepository.snapshot()
+        val streamBadgeRules = StreamBadgeSettingsRepository.snapshot()
         val autoPlayMode = playerSettings.streamAutoPlayMode
         val isAutoPlayEnabled = !manualSelection && autoPlayMode != StreamAutoPlayMode.MANUAL &&
             !(autoPlayMode == StreamAutoPlayMode.REGEX_MATCH &&
@@ -144,9 +141,13 @@ object StreamsRepository {
                 streams = embeddedStreams,
                 isLoading = false,
             )
+            val presentedGroup = StreamBadgePresentation.apply(
+                groups = listOf(group),
+                rules = streamBadgeRules,
+            ).firstOrNull() ?: group
             _uiState.value = StreamsUiState(
                 requestToken = requestToken,
-                groups = listOf(group),
+                groups = listOf(presentedGroup),
                 activeAddonIds = setOf("embedded"),
                 isAnyLoading = false,
             )
@@ -204,13 +205,8 @@ object StreamsRepository {
 
         // Initialise loading placeholders
         val installedAddonOrder = streamAddons.map { it.addonName }
-        val warmedAddonGroups = AddonStreamWarmupRepository
-            .cachedGroups(type = type, videoId = videoId, season = season, episode = episode)
-            .orEmpty()
-            .associateBy { it.addonId }
-        val warmedAddonIds = warmedAddonGroups.keys
         val initialGroups = StreamAutoPlaySelector.orderAddonStreams(streamAddons.map { addon ->
-            warmedAddonGroups[addon.addonId] ?: AddonStreamGroup(
+            AddonStreamGroup(
                 addonName = addon.addonName,
                 addonId = addon.addonId,
                 streams = emptyList(),
@@ -236,13 +232,12 @@ object StreamsRepository {
         )
 
         activeJob = scope.launch {
-            val pendingStreamAddons = streamAddons.filterNot { it.addonId in warmedAddonIds }
             val completions = Channel<StreamLoadCompletion>(capacity = Channel.BUFFERED)
             val pluginRemainingByAddonId = pluginProviderGroups
                 .associate { it.addonId to it.scrapers.size }
                 .toMutableMap()
             val pluginFirstErrorByAddonId = mutableMapOf<String, String>()
-            val totalTasks = pendingStreamAddons.size +
+            val totalTasks = streamAddons.size +
                 pluginProviderGroups.sumOf { it.scrapers.size }
 
             val installedAddonNames = installedAddonOrder.toSet()
@@ -255,11 +250,16 @@ object StreamsRepository {
                     log.d { "Ignoring late stream load completion after channel close" }
                 }
             }
-            fun presentDebridGroup(group: AddonStreamGroup): AddonStreamGroup =
-                DebridStreamPresentation.apply(
+            fun presentStreamGroup(group: AddonStreamGroup): AddonStreamGroup {
+                val badgeGroup = StreamBadgePresentation.apply(
                     groups = listOf(group),
-                    settings = debridSettings,
+                    rules = streamBadgeRules,
                 ).firstOrNull() ?: group
+                return DebridStreamPresentation.apply(
+                    groups = listOf(badgeGroup),
+                    settings = debridSettings,
+                ).firstOrNull() ?: badgeGroup
+            }
 
             fun publishAddonGroup(group: AddonStreamGroup) {
                 _uiState.update { current ->
@@ -278,22 +278,58 @@ object StreamsRepository {
                 }
             }
 
-            fun launchDebridAvailability(group: AddonStreamGroup) {
-                if (group.addonId !in installedAddonIds || group.streams.isEmpty()) return
+            fun publishAddonGroupAfterCacheCheck(group: AddonStreamGroup) {
+                if (group.addonId !in installedAddonIds || group.streams.isEmpty()) {
+                    publishAddonGroup(presentStreamGroup(group))
+                    return
+                }
 
                 val eligibleGroupIds = setOf(group.addonId)
+                val shouldWaitForCacheCheck = LocalDebridAvailabilityService.hasPendingCacheCheck(
+                    groups = listOf(group),
+                    eligibleGroupIds = eligibleGroupIds,
+                )
+                if (!shouldWaitForCacheCheck) {
+                    publishAddonGroup(presentStreamGroup(group))
+                    return
+                }
+
                 val checkingGroup = LocalDebridAvailabilityService.markChecking(
                     groups = listOf(group),
                     eligibleGroupIds = eligibleGroupIds,
                 ).firstOrNull() ?: group
-                publishAddonGroup(checkingGroup)
 
                 val availabilityJob = launch {
                     val availabilityGroup = LocalDebridAvailabilityService.annotateCachedAvailability(
                         groups = listOf(checkingGroup),
                         eligibleGroupIds = eligibleGroupIds,
                     ).firstOrNull() ?: checkingGroup
-                    publishAddonGroup(presentDebridGroup(availabilityGroup))
+                    publishAddonGroup(presentStreamGroup(availabilityGroup))
+
+                    // Early binge-group match right after this addon's availability is resolved
+                    if (isDirectAutoPlayFlow && !autoSelectTriggered && persistedBingeGroup != null && !timeoutElapsed) {
+                        val allStreams = _uiState.value.groups.flatMap { it.streams }
+                        if (allStreams.isNotEmpty()) {
+                            val earlyMatch = StreamAutoPlaySelector.selectAutoPlayStream(
+                                streams = allStreams,
+                                mode = autoPlayMode,
+                                regexPattern = playerSettings.streamAutoPlayRegex,
+                                source = playerSettings.streamAutoPlaySource,
+                                installedAddonNames = installedAddonNames,
+                                selectedAddons = playerSettings.streamAutoPlaySelectedAddons,
+                                selectedPlugins = playerSettings.streamAutoPlaySelectedPlugins,
+                                preferredBingeGroup = persistedBingeGroup,
+                                preferBingeGroupInSelection = true,
+                                bingeGroupOnly = true,
+                                debridEnabled = debridSettings.canResolvePlayableLinks,
+                                activeResolverProviderId = debridSettings.activeResolverProviderId,
+                            )
+                            if (earlyMatch != null) {
+                                autoSelectTriggered = true
+                                _uiState.update { it.copy(autoPlayStream = earlyMatch) }
+                            }
+                        }
+                    }
                 }
                 debridAvailabilityJobs += availabilityJob
             }
@@ -392,7 +428,7 @@ object StreamsRepository {
                 null
             }
 
-            pendingStreamAddons.forEach { addon ->
+            streamAddons.forEach { addon ->
                 launch {
                     val url = buildAddonResourceUrl(
                         manifestUrl = addon.manifest.transportUrl,
@@ -409,6 +445,7 @@ object StreamsRepository {
                             payload = payload,
                             addonName = displayName,
                             addonId = addon.addonId,
+                            addonLogo = addon.manifest.logoUrl,
                         )
                     }.fold(
                         onSuccess = { streams ->
@@ -481,8 +518,7 @@ object StreamsRepository {
                 when (val completion = completions.receive()) {
                     is StreamLoadCompletion.Addon -> {
                         val result = completion.group
-                        publishAddonGroup(result)
-                        launchDebridAvailability(result)
+                        publishAddonGroupAfterCacheCheck(result)
                     }
 
                     is StreamLoadCompletion.PluginScraper -> {
@@ -532,7 +568,34 @@ object StreamsRepository {
 
             for (availabilityJob in debridAvailabilityJobs) {
                 availabilityJob.join()
+
+                // Early binge-group match after each availability job completes
+                if (isDirectAutoPlayFlow && !autoSelectTriggered && persistedBingeGroup != null) {
+                    val allStreams = _uiState.value.groups.flatMap { it.streams }
+                    if (allStreams.isNotEmpty()) {
+                        val earlyMatch = StreamAutoPlaySelector.selectAutoPlayStream(
+                            streams = allStreams,
+                            mode = autoPlayMode,
+                            regexPattern = playerSettings.streamAutoPlayRegex,
+                            source = playerSettings.streamAutoPlaySource,
+                            installedAddonNames = installedAddonNames,
+                            selectedAddons = playerSettings.streamAutoPlaySelectedAddons,
+                            selectedPlugins = playerSettings.streamAutoPlaySelectedPlugins,
+                            preferredBingeGroup = persistedBingeGroup,
+                            preferBingeGroupInSelection = true,
+                            bingeGroupOnly = !timeoutElapsed,
+                            debridEnabled = debridSettings.canResolvePlayableLinks,
+                            activeResolverProviderId = debridSettings.activeResolverProviderId,
+                        )
+                        if (earlyMatch != null) {
+                            autoSelectTriggered = true
+                            _uiState.update { it.copy(autoPlayStream = earlyMatch) }
+                            break
+                        }
+                    }
+                }
             }
+
             launch {
                 DirectDebridStreamPreparer.prepare(
                     streams = _uiState.value.groups
@@ -552,6 +615,31 @@ object StreamsRepository {
                                 eligibleGroupIds = installedAddonIds,
                             ),
                         )
+                    }
+
+                    // Early binge-group match after each debrid-prepared stream
+                    if (isDirectAutoPlayFlow && !autoSelectTriggered && persistedBingeGroup != null) {
+                        val allStreams = _uiState.value.groups.flatMap { it.streams }
+                        if (allStreams.isNotEmpty()) {
+                            val earlyMatch = StreamAutoPlaySelector.selectAutoPlayStream(
+                                streams = allStreams,
+                                mode = autoPlayMode,
+                                regexPattern = playerSettings.streamAutoPlayRegex,
+                                source = playerSettings.streamAutoPlaySource,
+                                installedAddonNames = installedAddonNames,
+                                selectedAddons = playerSettings.streamAutoPlaySelectedAddons,
+                                selectedPlugins = playerSettings.streamAutoPlaySelectedPlugins,
+                                preferredBingeGroup = persistedBingeGroup,
+                                preferBingeGroupInSelection = true,
+                                bingeGroupOnly = !timeoutElapsed,
+                                debridEnabled = debridSettings.canResolvePlayableLinks,
+                                activeResolverProviderId = debridSettings.activeResolverProviderId,
+                            )
+                            if (earlyMatch != null) {
+                                autoSelectTriggered = true
+                                _uiState.update { it.copy(autoPlayStream = earlyMatch) }
+                            }
+                        }
                     }
                 }
 
@@ -706,137 +794,9 @@ object StreamsRepository {
         activeRequestKey = null
         _uiState.value = StreamsUiState()
     }
-}
 
-private data class InstalledStreamAddonTarget(
-    val addonName: String,
-    val addonId: String,
-    val manifest: com.nuvio.app.features.addons.AddonManifest,
-)
-
-private fun com.nuvio.app.features.addons.ManagedAddon.streamAddonInstanceId(manifestId: String): String =
-    "addon:$manifestId:$manifestUrl"
-
-private data class PluginProviderGroup(
-    val addonId: String,
-    val addonName: String,
-    val scrapers: List<PluginScraper>,
-)
-
-private sealed interface StreamLoadCompletion {
-    data class Addon(val group: AddonStreamGroup) : StreamLoadCompletion
-    data class PluginScraper(
-        val addonId: String,
-        val streams: List<StreamItem>,
-        val error: String?,
-    ) : StreamLoadCompletion
-}
-
-private fun List<PluginScraper>.toPluginProviderGroups(
-    repositories: List<PluginRepositoryItem>,
-    groupByRepository: Boolean,
-): List<PluginProviderGroup> {
-    if (!groupByRepository) {
-        return map { scraper ->
-            PluginProviderGroup(
-                addonId = "plugin:${scraper.id}",
-                addonName = scraper.name,
-                scrapers = listOf(scraper),
-            )
-        }
-    }
-
-    val repoNameByUrl = repositories.associate { it.manifestUrl to it.name }
-    return groupBy { it.repositoryUrl }
-        .map { (repositoryUrl, scrapers) ->
-            PluginProviderGroup(
-                addonId = "plugin-repo:${repositoryUrl.lowercase()}",
-                addonName = repoNameByUrl[repositoryUrl].orEmpty().ifBlank { repositoryUrl.fallbackRepositoryLabel() },
-                scrapers = scrapers.sortedBy { it.name.lowercase() },
-            )
-        }
-        .sortedBy { it.addonName.lowercase() }
-}
-
-private fun List<AddonStreamGroup>.toEmptyStateReason(anyLoading: Boolean): StreamsEmptyStateReason? {
-    if (anyLoading || any { it.streams.isNotEmpty() }) {
-        return null
-    }
-
-    return if (isNotEmpty() && all { !it.error.isNullOrBlank() }) {
-        StreamsEmptyStateReason.StreamFetchFailed
-    } else {
-        StreamsEmptyStateReason.NoStreamsFound
+    fun setOverlayVisible(visible: Boolean, message: String? = null) {
+        _uiState.update { it.copy(showDirectAutoPlayOverlay = visible, overlayMessage = message) }
     }
 }
 
-private suspend fun <T> runCatchingUnlessCancelled(block: suspend () -> T): Result<T> =
-    try {
-        Result.success(block())
-    } catch (error: CancellationException) {
-        throw error
-    } catch (error: Throwable) {
-        Result.failure(error)
-    }
-
-private fun PluginRuntimeResult.toStreamItem(
-    scraper: PluginScraper,
-    addonName: String = scraper.name,
-    addonId: String = "plugin:${scraper.id}",
-    includeScraperNameInSubtitle: Boolean = false,
-): StreamItem {
-    val subtitleParts = listOfNotNull(
-        scraper.name.takeIf { includeScraperNameInSubtitle && it.isNotBlank() },
-        quality?.takeIf { it.isNotBlank() },
-        size?.takeIf { it.isNotBlank() },
-        language?.takeIf { it.isNotBlank() },
-    )
-    val requestHeaders = headers
-        .orEmpty()
-        .mapNotNull { (key, value) ->
-            val headerName = key.trim()
-            val headerValue = value.trim()
-            if (headerName.isBlank() || headerValue.isBlank() || headerName.equals("Range", ignoreCase = true)) {
-                null
-            } else {
-                headerName to headerValue
-            }
-        }
-        .toMap()
-
-    return StreamItem(
-        name = name ?: title,
-        description = subtitleParts.joinToString(" • ").ifBlank { null },
-        url = url,
-        infoHash = infoHash,
-        sourceName = scraper.name,
-        addonName = addonName,
-        addonId = addonId,
-        behaviorHints = if (requestHeaders.isEmpty()) {
-            StreamBehaviorHints()
-        } else {
-            StreamBehaviorHints(
-                notWebReady = true,
-                proxyHeaders = StreamProxyHeaders(request = requestHeaders),
-            )
-        },
-    )
-}
-
-private fun List<StreamItem>.sortedForGroupedDisplay(): List<StreamItem> =
-    sortedWith(
-        compareBy<StreamItem>(
-            { it.sourceName.orEmpty().lowercase() },
-            { it.streamLabel.lowercase() },
-            { it.streamSubtitle.orEmpty().lowercase() },
-        ),
-    )
-
-private fun String.fallbackRepositoryLabel(): String {
-    val withoutQuery = substringBefore("?")
-    val withoutManifest = withoutQuery.removeSuffix("/manifest.json")
-    val host = withoutManifest.substringAfter("://", withoutManifest).substringBefore('/')
-    return host.ifBlank {
-        withoutManifest.substringAfterLast('/').ifBlank { "Plugin repository" }
-    }
-}
