@@ -6,3 +6,7 @@
 [submodule "stremio-community-v5"]
 	path = stremio-community-v5
 	url = https://github.com/Zaarrg/stremio-community-v5.git
+
+[submodule "vendor/TorrServer"]
+	path = vendor/TorrServer
+	url = https://github.com/tapframe/TorrServer.git
