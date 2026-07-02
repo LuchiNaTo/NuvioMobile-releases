@@ -112,11 +112,19 @@ jobs:
             echo "NUVIO_RELEASE_KEY_PASSWORD=$key_password"
           } >> local.properties
 
-      - name: Build per-ABI release APKs (full + playstore)
+      - name: Build per-ABI release APKs
         run: |
+          set -euo pipefail
+
           ./gradlew \
             :composeApp:assembleFullRelease \
+            -Pnuvio.android.distribution=full \
+            -Pnuvio.splitAbi=true \
+            --stacktrace
+
+          ./gradlew \
             :composeApp:assemblePlaystoreRelease \
+            -Pnuvio.android.distribution=playstore \
             -Pnuvio.splitAbi=true \
             --stacktrace
 
@@ -208,6 +216,12 @@ jobs:
           EOF
           # Make sure no stale daemon is hanging around with the old args.
           ./gradlew --stop || true
+
+      - name: Build MPVKit binary artifacts
+        run: |
+          set -euo pipefail
+          make -C MPVKit build platform=ios
+          ls -la MPVKit/dist/release/xcframework
 
       - name: Archive iOS app (Release, unsigned)
         run: |
